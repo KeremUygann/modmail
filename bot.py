@@ -22,7 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-__version__ = '2.0.3'
+__version__ = '2.0.6'
 
 import asyncio
 import textwrap
@@ -36,20 +36,17 @@ from discord.ext import commands
 from discord.ext.commands.view import StringView
 from colorama import init, Fore, Style
 
-init()
-
 from core.api import Github, ModmailApiClient
 from core.thread import ThreadManager
 from core.config import ConfigManager
 
 
+init()
 
 line = Fore.BLACK + Style.BRIGHT + '-------------------------' + Style.RESET_ALL
 
 
 class ModmailBot(commands.Bot):
-
-    mutable_config_keys = ['prefix', 'status', 'guild_id', 'mention', 'autoupdates', 'modmail_guild_id']
 
     def __init__(self):
         super().__init__(command_prefix=self.get_pre)
@@ -62,7 +59,7 @@ class ModmailBot(commands.Bot):
         self.data_task = self.loop.create_task(self.data_loop())
         self.autoupdate_task = self.loop.create_task(self.autoupdate_loop())
         self._add_commands()
-    
+
     def _add_commands(self):
         """Adds commands automatically"""
         self.remove_command('help')
@@ -123,10 +120,14 @@ class ModmailBot(commands.Bot):
             return self.guild
         else:
             return discord.utils.get(self.guilds, id=int(modmail_guild_id))
+    
+    @property
+    def using_multiple_server_setup(self):
+        return self.modmail_guild != self.guild
 
     @property
     def main_category(self):
-        if self.guild:
+        if self.modmail_guild:
             return discord.utils.get(self.modmail_guild.categories, name='Mod Mail')
 
     @property
@@ -153,7 +154,6 @@ class ModmailBot(commands.Bot):
         status = self.config.get('status')
         if status:
             await self.change_presence(activity=discord.Game(status))
-        
 
     async def on_ready(self):
         """Bot startup, sets uptime."""
@@ -167,7 +167,10 @@ class ModmailBot(commands.Bot):
         {line}
         """).strip())
 
-        await self.threads.populate_cache()
+        if not self.guild:
+            print(Fore.RED + Style.BRIGHT + 'WARNING - The GUILD_ID provided does not exist!' + Style.RESET_ALL)
+        else:
+            await self.threads.populate_cache()
 
     async def process_modmail(self, message):
         """Processes messages sent to the bot."""
@@ -229,7 +232,7 @@ class ModmailBot(commands.Bot):
         return ctx
 
     async def on_message(self, message):
-        if message.type == discord.MessageType.pins_add and message.author == self.user: 
+        if message.type == discord.MessageType.pins_add and message.author == self.user:
             await message.delete()
         if message.author.bot:
             return
@@ -244,21 +247,64 @@ class ModmailBot(commands.Bot):
                 message.content = f'{prefix}reply {self.snippets[cmd]}'
 
         await self.process_commands(message)
+    
+    async def on_guild_channel_delete(self, channel):
+        if channel.guild != self.modmail_guild:
+            return 
+        thread = await self.threads.find(channel=channel)
+        if thread:
+            del self.threads.cache[thread.id]
+
+            mod = None 
+
+            audit_logs = self.modmail_guild.audit_logs()
+            entry = await audit_logs.find(lambda e: e.target.id == channel.id)
+            mod = entry.user
+            if mod.bot:
+                return
+
+            log_data = await self.modmail_api.post_log(channel.id, {
+                'open': False,
+                'closed_at': str(datetime.datetime.utcnow()),
+                'closer': {
+                    'id': str(mod.id),
+                    'name': mod.name,
+                    'discriminator': mod.discriminator,
+                    'avatar_url': mod.avatar_url,
+                    'mod': True
+                }})
+
+            em = discord.Embed(title='Thread Closed')
+            em.description = f'{mod.mention} has closed this modmail thread.'
+            em.color = discord.Color.red()
+
+            try:
+                await thread.recipient.send(embed=em)
+            except:
+                pass
+            
+            log_url = f"https://logs.modmail.tk/{log_data['user_id']}/{log_data['key']}"
+
+            user = thread.recipient.mention if thread.recipient else f'`{thread.id}`'
+
+            desc = f"[`{log_data['key']}`]({log_url}) {mod.mention} closed a thread with {user}"
+            em = discord.Embed(description=desc, color=em.color)
+            em.set_author(name='Thread closed', url=log_url)
+            await self.main_category.channels[0].send(embed=em)
 
     async def on_message_delete(self, message):
         """Support for deleting linked messages"""
         if message.embeds and not isinstance(message.channel, discord.DMChannel):
-            matches = re.findall(r'\d+', str(message.embeds[0].author.url))
-            if matches:
+            message_id = str(message.embeds[0].author.url).split('/')[-1]
+            if message_id.isdigit():
                 thread = await self.threads.find(channel=message.channel)
 
                 channel = thread.recipient.dm_channel
-                message_id = matches[0]
 
                 async for msg in channel.history():
                     if msg.embeds and msg.embeds[0].author:
-                        url = msg.embeds[0].author.url
-                        if message_id == re.findall(r'\d+', url)[0]:
+                        url = str(msg.embeds[0].author.url)
+                        if message_id == url.split('/')[-1]:
                             return await msg.delete()
 
     async def on_message_edit(self, before, after):
@@ -269,8 +315,8 @@ class ModmailBot(commands.Bot):
             async for msg in thread.channel.history():
                 if msg.embeds:
                     embed = msg.embeds[0]
-                    matches = re.findall(r'\d+', str(embed.author.url))
-                    if matches and int(matches[0]) == before.id:
+                    matches = str(embed.author.url).split('/')
+                    if matches and matches[-1] == str(before.id):
                         if ' - (Edited)' not in embed.footer.text:
                             embed.set_footer(text=embed.footer.text + ' - (Edited)')
                         embed.description = after.content
@@ -297,9 +343,9 @@ class ModmailBot(commands.Bot):
         return overwrites
 
     async def validate_api_token(self):
-        valid = True 
+        valid = True
         try:
-            token = self.config.modmail_api_token
+            self.config.modmail_api_token
         except KeyError:
             print('MODMAIL_API_TOKEN not found.')
             print('Set a config variable called MODMAIL_API_TOKEN with a token from https://dashboard.modmail.tk')
@@ -312,8 +358,10 @@ class ModmailBot(commands.Bot):
             if not valid:
                 await self.logout()
             else:
-                print(Style.RESET_ALL + Fore.CYAN + 'Validated API token.' + Style.RESET_ALL)
-        
+                username = (await self.modmail_api.get_user_info())['user']['username']
+                print(Style.RESET_ALL + Fore.CYAN + 'Validated token.' )
+                print(f'GitHub user: {username}' + Style.RESET_ALL)
+
     async def data_loop(self):
         await self.wait_until_ready()
 
@@ -343,7 +391,7 @@ class ModmailBot(commands.Bot):
 
             if metadata['latest_version'] != self.version:
                 data = await self.modmail_api.update_repository()
-                print('Updating bot.')
+                
 
                 em = discord.Embed(title='Updating bot', color=discord.Color.green())
 
@@ -358,6 +406,7 @@ class ModmailBot(commands.Bot):
                     html_url = commit_data["html_url"]
                     short_sha = commit_data['sha'][:6]
                     em.add_field(name='Merge Commit', value=f"[`{short_sha}`]({html_url}) {message} - {user['username']}")
+                    print('Updating bot.')
                 else:
                     await asyncio.sleep(3600)
                     continue
